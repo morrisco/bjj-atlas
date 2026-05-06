@@ -25,4 +25,12 @@ alter table edges enable row level security;
 create policy "public_read_nodes" on nodes for select using (true);
 create policy "public_read_edges" on edges for select using (true);
 
--- Writes are handled server-side via the service role key, which bypasses RLS.
+-- Write access via the publishable (anon) key.
+-- TODO: restrict to authenticated users once auth is added.
+create policy "anon_insert_nodes" on nodes for insert to anon with check (true);
+create policy "anon_update_nodes" on nodes for update to anon using (true);
+create policy "anon_delete_nodes" on nodes for delete to anon using (true);
+
+create policy "anon_insert_edges" on edges for insert to anon with check (true);
+create policy "anon_update_edges" on edges for update to anon using (true);
+create policy "anon_delete_edges" on edges for delete to anon using (true);
