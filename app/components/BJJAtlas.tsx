@@ -221,9 +221,11 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
   const animRef  = useRef<{ from: Positions; to: Positions; start: number } | null>(null)
   const rafRef   = useRef<number>(0)
 
-  const panState   = useRef({ active: false, sx: 0, sy: 0, stx: 0, sty: 0 })
-  const dragState  = useRef({ nodeId: null as string | null, moved: false })
-  const clickStart = useRef<{ x: number; y: number } | null>(null)
+  const panState    = useRef({ active: false, sx: 0, sy: 0, stx: 0, sty: 0 })
+  const dragState   = useRef({ nodeId: null as string | null, moved: false })
+  const clickStart  = useRef<{ x: number; y: number; nodeId: string | null } | null>(null)
+  const pointersRef = useRef(new Map<number, Vec2>())
+  const pinchRef    = useRef<{ dist: number; midX: number; midY: number; base: { x: number; y: number; scale: number } } | null>(null)
 
   // ── Resize observer ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -339,14 +341,59 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
     return { x: (cx - rect.left - t.x) / t.scale, y: (cy - rect.top - t.y) / t.scale }
   }, [])
 
-  // ── Pointer handlers ─────────────────────────────────────────────────────────
-  const onSvgMouseDown = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
-    if (e.button !== 0) return
-    const t = transformRef.current
-    panState.current = { active: true, sx: e.clientX, sy: e.clientY, stx: t.x, sty: t.y }
+  // ── Unified pointer handlers (mouse + touch + stylus) ────────────────────────
+  const onPointerDown = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId)
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    const ptrs = Array.from(pointersRef.current.values())
+
+    if (ptrs.length === 2) {
+      panState.current.active = false
+      dragState.current = { nodeId: null, moved: false }
+      pinnedId.current = null
+      const [p1, p2] = ptrs
+      pinchRef.current = {
+        dist: Math.hypot(p2.x - p1.x, p2.y - p1.y),
+        midX: (p1.x + p2.x) / 2,
+        midY: (p1.y + p2.y) / 2,
+        base: { ...transformRef.current },
+      }
+      return
+    }
+    if (ptrs.length > 2) return
+
+    pinchRef.current = null
+    const nodeEl = (e.target as Element).closest('[data-node-id]')
+    const nodeId = nodeEl?.getAttribute('data-node-id') ?? null
+    clickStart.current = { x: e.clientX, y: e.clientY, nodeId }
+
+    if (nodeId && layoutRef.current === 'force') {
+      dragState.current = { nodeId, moved: false }
+      pinnedId.current = nodeId
+      panState.current.active = false
+    } else if (!nodeId) {
+      const t = transformRef.current
+      panState.current = { active: true, sx: e.clientX, sy: e.clientY, stx: t.x, sty: t.y }
+    }
   }, [])
 
-  const onSvgMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+  const onPointerMove = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
+    if (!pointersRef.current.has(e.pointerId)) return
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+    const pinch = pinchRef.current
+    if (pinch && pointersRef.current.size === 2) {
+      const [p1, p2] = Array.from(pointersRef.current.values())
+      const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y)
+      const newScale = Math.max(0.15, Math.min(6, pinch.base.scale * (dist / pinch.dist)))
+      const rect = svgRef.current?.getBoundingClientRect(); if (!rect) return
+      const cmx = pinch.midX - rect.left
+      const cmy = pinch.midY - rect.top
+      const sf = newScale / pinch.base.scale
+      setTransform({ scale: newScale, x: cmx - (cmx - pinch.base.x) * sf, y: cmy - (cmy - pinch.base.y) * sf })
+      return
+    }
+
     const { nodeId } = dragState.current
     if (nodeId && layoutRef.current === 'force') {
       dragState.current.moved = true
@@ -359,32 +406,31 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
     }
   }, [screenToWorld])
 
-  const onSvgMouseUp = useCallback(() => {
+  const onPointerUp = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
+    pointersRef.current.delete(e.pointerId)
+    const wasPinching = pinchRef.current !== null
+    if (pointersRef.current.size < 2) pinchRef.current = null
+    if (wasPinching) return
+
+    const start = clickStart.current
     panState.current.active = false
     dragState.current = { nodeId: null, moved: false }
     pinnedId.current = null
-  }, [])
+    clickStart.current = null
 
-  const onNodeMouseDown = useCallback((e: React.MouseEvent, id: string) => {
-    e.stopPropagation()
-    clickStart.current = { x: e.clientX, y: e.clientY }
-    panState.current.active = false
-    if (layoutRef.current === 'force') {
-      dragState.current = { nodeId: id, moved: false }
-      pinnedId.current = id
-    }
-  }, [])
-
-  const onNodeMouseUp = useCallback((e: React.MouseEvent, id: string) => {
-    e.stopPropagation()
-    const start = clickStart.current
-    const { moved } = dragState.current
-    dragState.current = { nodeId: null, moved: false }
-    pinnedId.current = null; clickStart.current = null
-    if (start && !moved) {
+    if (start?.nodeId) {
       const dx = e.clientX - start.x, dy = e.clientY - start.y
-      if (dx * dx + dy * dy < 36) setSelectedId(cur => cur === id ? null : id)
+      if (dx * dx + dy * dy < 100) setSelectedId(cur => cur === start.nodeId ? null : start.nodeId)
     }
+  }, [])
+
+  const onPointerCancel = useCallback(() => {
+    pointersRef.current.clear()
+    pinchRef.current = null
+    panState.current.active = false
+    dragState.current = { nodeId: null, moved: false }
+    pinnedId.current = null
+    clickStart.current = null
   }, [])
 
   // ── CRUD actions ─────────────────────────────────────────────────────────────
@@ -448,42 +494,44 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100 select-none overflow-hidden">
 
       {/* ── Toolbar ── */}
-      <div className="flex items-center gap-2 px-4 py-2 bg-gray-900 border-b border-gray-800 flex-shrink-0 flex-wrap">
-        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider mr-1">View</span>
-        {(['dag', 'force', 'radial'] as Layout[]).map(m => (
-          <button key={m} onClick={() => changeLayout(m)}
-            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-              layout === m ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
-            }`}>
-            {m === 'dag' ? 'Layered' : m === 'force' ? 'Force' : 'Radial'}
-          </button>
-        ))}
-        <div className="w-px h-4 bg-gray-700 mx-1" />
-        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider mr-1">Filter</span>
-        {(Object.entries(TYPE_LABELS) as [NodeType, string][]).map(([type, label]) => {
-          const on = filterTypes.has(type); const c = TYPE_COLOR[type]
-          return (
-            <button key={type}
-              onClick={() => setFilterTypes(ft => { const s = new Set(ft); on ? s.delete(type) : s.add(type); return s })}
-              className="px-2.5 py-1 rounded text-xs font-medium transition-all border"
-              style={{ background: on ? c.bg : 'transparent', borderColor: c.border, color: on ? c.text : '#4b5563' }}>
-              {label}
+      <div className="flex flex-col bg-gray-900 border-b border-gray-800 flex-shrink-0">
+        <div className="flex items-center gap-2 px-4 py-2">
+          <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">View</span>
+          {(['dag', 'force', 'radial'] as Layout[]).map(m => (
+            <button key={m} onClick={() => changeLayout(m)}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                layout === m ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+              }`}>
+              {m === 'dag' ? 'Layered' : m === 'force' ? 'Force' : 'Radial'}
             </button>
-          )
-        })}
-        <button onClick={openAdd}
-          className="ml-auto px-3 py-1 rounded text-xs font-medium bg-indigo-700 hover:bg-indigo-600 text-white transition-colors">
-          + Add Move
-        </button>
+          ))}
+          <button onClick={openAdd}
+            className="ml-auto px-3 py-1 rounded text-xs font-medium bg-indigo-700 hover:bg-indigo-600 text-white transition-colors whitespace-nowrap">
+            + Add
+          </button>
+        </div>
+        <div className="flex items-center gap-2 px-4 pb-2 overflow-x-auto">
+          {(Object.entries(TYPE_LABELS) as [NodeType, string][]).map(([type, label]) => {
+            const on = filterTypes.has(type); const c = TYPE_COLOR[type]
+            return (
+              <button key={type}
+                onClick={() => setFilterTypes(ft => { const s = new Set(ft); on ? s.delete(type) : s.add(type); return s })}
+                className="px-2.5 py-1 rounded text-xs font-medium transition-all border flex-shrink-0"
+                style={{ background: on ? c.bg : 'transparent', borderColor: c.border, color: on ? c.text : '#4b5563' }}>
+                {label}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* ── Canvas + side panel ── */}
       <div className="flex flex-1 min-h-0">
 
-        <div ref={containerRef} className="flex-1 relative overflow-hidden cursor-grab active:cursor-grabbing">
+        <div ref={containerRef} className="flex-1 relative overflow-hidden cursor-grab active:cursor-grabbing" style={{ touchAction: 'none' }}>
           <svg ref={svgRef} className="w-full h-full"
-            onMouseDown={onSvgMouseDown} onMouseMove={onSvgMouseMove}
-            onMouseUp={onSvgMouseUp} onMouseLeave={onSvgMouseUp}>
+            onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
 
             <defs>
               <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
@@ -543,8 +591,7 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
                 const lines = wrapLabel(n.name)
                 return (
                   <g key={n.id} transform={`translate(${p.x},${p.y})`}
-                    onMouseDown={ev => onNodeMouseDown(ev, n.id)}
-                    onMouseUp={ev => onNodeMouseUp(ev, n.id)}
+                    data-node-id={n.id}
                     style={{ cursor: layout === 'force' ? 'grab' : 'pointer' }}>
                     {isSel && <circle r={NODE_R + 7} fill="none" stroke="#818cf8" strokeWidth={2} opacity={0.6} />}
                     {isRel && <circle r={NODE_R + 4} fill="none" stroke={c.border} strokeWidth={1.5} opacity={0.5} />}
@@ -562,9 +609,9 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
           </svg>
         </div>
 
-        {/* ── Side panel ── */}
+        {/* ── Side panel (bottom sheet on mobile, sidebar on sm+) ── */}
         {selectedNode && (
-          <div className="w-60 bg-gray-900 border-l border-gray-800 flex flex-col overflow-y-auto flex-shrink-0">
+          <div className="fixed bottom-0 left-0 right-0 z-40 rounded-t-2xl border-t border-gray-800 max-h-[60vh] overflow-y-auto sm:static sm:bottom-auto sm:left-auto sm:right-auto sm:z-auto sm:rounded-none sm:border-t-0 sm:border-l sm:w-60 sm:max-h-none sm:flex-shrink-0 bg-gray-900 flex flex-col">
 
             <div className="p-4 border-b border-gray-800">
               <div className="flex items-start justify-between gap-2">
@@ -634,7 +681,7 @@ export default function BJJAtlas({ initialNodes, initialEdges }: Props) {
       {/* ── Add / Edit modal ── */}
       {modalOpen && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={closeModal}>
-          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-lg" onClick={e => e.stopPropagation()}>
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
             <h2 className="text-sm font-semibold text-gray-100 mb-4">{editingId ? 'Edit Move' : 'Add Move'}</h2>
 
             <div className="flex flex-col gap-3">
